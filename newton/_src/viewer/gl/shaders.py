@@ -49,6 +49,11 @@ layout (location = 7) in vec3 aObjectColor;
 // material properties
 layout (location = 8) in vec4 aMaterial;
 
+// optional per-vertex color, alpha selects between aObjectColor (0) and aVertexColor.rgb (1).
+// The generic attribute default is (0,0,0,1), so callers that do not bind a per-vertex color
+// array must zero the alpha themselves.
+layout (location = 9) in vec4 aVertexColor;
+
 uniform mat4 view;
 uniform mat4 projection;
 uniform mat4 light_space_matrix;
@@ -80,7 +85,7 @@ void main()
     if (determinant(rotation) < 0.0) normalMatrix = -normalMatrix;
     Normal = normalMatrix * aNormal;
     TexCoord = aTexCoord;
-    ObjectColor = aObjectColor;
+    ObjectColor = mix(aObjectColor, aVertexColor.rgb, aVertexColor.a);
     FragPosLightSpace = light_space_matrix * worldPos;
     Material = aMaterial;
 }

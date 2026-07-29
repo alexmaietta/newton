@@ -350,6 +350,8 @@ add_basic_example_test(
 
 add_basic_example_test(name="basic.example_basic_viewer", devices=test_devices, use_viewer=True)
 
+add_basic_example_test(name="basic.example_basic_vertex_colors", devices=test_devices, use_viewer=True)
+
 add_basic_example_test(
     name="basic.example_basic_joints",
     devices=test_devices,
@@ -1213,6 +1215,19 @@ add_example_test(
     name="kamino.example_kamino_robot_anymal_d",
     devices=cuda_test_devices,
     test_options={"num-frames": 120},
+    use_viewer=True,
+)
+
+
+class TestSCMExamples(NewtonTestCase):
+    pass
+
+
+add_example_test(
+    TestSCMExamples,
+    name="scm.example_scm_sphere",
+    devices=test_devices,
+    test_options={"num-frames": 200},
     use_viewer=True,
 )
 

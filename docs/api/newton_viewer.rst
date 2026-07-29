@@ -13,6 +13,7 @@ newton.viewer
    :toctree: _generated
    :nosignatures:
 
+   Colormap
    Layer
    ViewerBase
    ViewerFile
@@ -22,3 +23,11 @@ newton.viewer
    ViewerRerun
    ViewerUSD
    ViewerViser
+
+.. rubric:: Functions
+
+.. autosummary::
+   :toctree: _generated
+   :signatures: long
+
+   sample_colormap

@@ -45,6 +45,11 @@ class ViewerRerun(ViewerBase):
         return np.asarray(x)
 
     @staticmethod
+    def _colors_to_u8(colors: np.ndarray) -> np.ndarray:
+        """Convert RGB colors in [0, 1] to the uint8 triplets rerun expects."""
+        return np.clip(np.asarray(colors, dtype=np.float32) * 255.0, 0.0, 255.0).astype(np.uint8)
+
+    @staticmethod
     def _call_rr_constructor(ctor, **kwargs):
         """Call a rerun constructor with only supported keyword args."""
         try:
@@ -255,6 +260,7 @@ class ViewerRerun(ViewerBase):
         color: tuple[float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        vertex_colors: wp.array[wp.vec3] | None = None,
     ):
         """
         Log a mesh to rerun for visualization.
@@ -274,6 +280,9 @@ class ViewerRerun(ViewerBase):
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            vertex_colors: Optional per-vertex RGB colors in [0, 1], shape
+                [len(points), 3]. They take the place of the per-instance
+                colors passed to :meth:`log_instances`.
         """
         name = self._qualify(name)
 
@@ -319,6 +328,15 @@ class ViewerRerun(ViewerBase):
         if texture_image is not None and self._mesh3d_supports("albedo_texture_buffer"):
             texture_buffer, texture_format = self._build_texture_components(texture_image)
 
+        vertex_colors_np = None
+        if vertex_colors is not None:
+            vertex_colors_np = self._colors_to_u8(self._to_numpy(vertex_colors))
+            if len(vertex_colors_np) != len(points_np):
+                raise ValueError(
+                    f"Mesh {name} has {len(vertex_colors_np)} vertex colors for {len(points_np)} vertices; "
+                    "counts must match."
+                )
+
         # make sure deformable mesh updates are not kept in the viewer if desired
         static = name in self._meshes and not self.keep_historical_data
 
@@ -331,6 +349,7 @@ class ViewerRerun(ViewerBase):
             "texture_image": texture_image,
             "texture_buffer": texture_buffer,
             "texture_format": texture_format,
+            "vertex_colors": vertex_colors_np,
         }
 
         if hidden:
@@ -341,6 +360,8 @@ class ViewerRerun(ViewerBase):
             "triangle_indices": indices_np,
             "vertex_normals": self._meshes[name]["normals"],
         }
+        if vertex_colors_np is not None:
+            mesh_kwargs["vertex_colors"] = vertex_colors_np
         if uvs_np is not None and self._mesh3d_supports("vertex_texcoords"):
             mesh_kwargs["vertex_texcoords"] = uvs_np
         if texture_buffer is not None and texture_format is not None:
@@ -399,12 +420,11 @@ class ViewerRerun(ViewerBase):
 
             # Handle colors - ReRun doesn't support per-instance colors
             # so we just use the first instance's color for all instances
-            vertex_colors = None
-            if colors is not None and not has_texture:
+            vertex_colors = mesh_data.get("vertex_colors")
+            if vertex_colors is None and colors is not None and not has_texture:
                 colors_np = self._to_numpy(colors).astype(np.float32)
                 # Take the first instance's color and apply to all vertices
-                first_color = colors_np[0]
-                color_rgb = np.array(first_color * 255, dtype=np.uint8)
+                color_rgb = self._colors_to_u8(colors_np[0])
                 num_vertices = len(mesh_data["points"])
                 vertex_colors = np.tile(color_rgb, (num_vertices, 1))
 

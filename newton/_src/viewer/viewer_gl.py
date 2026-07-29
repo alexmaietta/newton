@@ -749,7 +749,12 @@ class ViewerGL(ViewerBase):
         self._packed_write_indices = wp.array(write_np, dtype=int, device=device)
         self._packed_world_xforms = all_world_xforms
         self._packed_vbo_xforms = wp.empty(total, dtype=wp.mat44, device=device)
-        self._packed_vbo_xforms_host = wp.empty(total, dtype=wp.mat44, device="cpu", pinned=True)
+        # Pinned host memory is a CUDA allocation even though the array lives on
+        # the host, so it is only requested when a usable CUDA device is present.
+        # Without one, wp_alloc_pinned fails and the allocation raises.
+        self._packed_vbo_xforms_host = wp.empty(
+            total, dtype=wp.mat44, device="cpu", pinned=wp.get_device(device).is_cuda
+        )
 
     def _rebuild_gl_shape_caches(self):
         """Rebuild GL-specific caches after shape instances change.
@@ -854,6 +859,7 @@ class ViewerGL(ViewerBase):
         color: tuple[float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        vertex_colors: wp.array[wp.vec3] | wp.array[wp.float32] | np.ndarray | None = None,
     ):
         """
         Log a mesh for rendering.
@@ -873,6 +879,11 @@ class ViewerGL(ViewerBase):
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            vertex_colors: Optional per-vertex RGB colors in [0, 1], shape
+                [len(points), 3]. They take the place of ``color`` (and of the
+                per-instance colors passed to :meth:`log_instances`), and are
+                still modulated by ``texture``. Passing ``None`` clears colors
+                logged previously for this mesh.
         """
         assert isinstance(points, wp.array)
         assert isinstance(indices, wp.array)
@@ -882,12 +893,20 @@ class ViewerGL(ViewerBase):
         # Route user-supplied names through the active layer (idempotent).
         name = self._qualify(name)
 
+        if vertex_colors is not None:
+            if isinstance(vertex_colors, np.ndarray):
+                vertex_colors = wp.array(vertex_colors, dtype=wp.vec3, device=self.device)
+            elif isinstance(vertex_colors, wp.array) and vertex_colors.dtype == wp.float32:
+                vertex_colors = vertex_colors.reshape((len(points), 3)).view(dtype=wp.vec3)
+            assert isinstance(vertex_colors, wp.array)
+            assert len(vertex_colors) == len(points), "Number of vertex colors must match number of points"
+
         if name not in self.objects:
             self.objects[name] = MeshGL(
                 len(points), len(indices), self.device, hidden=hidden, backface_culling=backface_culling
             )
 
-        self.objects[name].update(points, indices, normals, uvs, texture)
+        self.objects[name].update(points, indices, normals, uvs, texture, vertex_colors)
         self.objects[name].hidden = hidden
         self.objects[name].backface_culling = backface_culling
 
@@ -1588,7 +1607,7 @@ class ViewerGL(ViewerBase):
                 record_tape=False,
             )
             wp.copy(self._packed_vbo_xforms_host, self._packed_vbo_xforms)
-            wp.synchronize()  # copy is async (pinned destination), must sync before CPU read
+            wp.synchronize()  # async into a pinned destination on CUDA; must sync before CPU read
 
             # ---- Upload pinned host slices to GL per instancer ----
             host_np = self._packed_vbo_xforms_host.numpy()

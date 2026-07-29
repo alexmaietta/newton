@@ -1508,6 +1508,7 @@ class ViewerBase(ABC):
         color: tuple[float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        vertex_colors: wp.array[wp.vec3] | None = None,
     ):
         """
         Register or update a mesh prototype in the viewer backend.
@@ -1532,6 +1533,12 @@ class ViewerBase(ABC):
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            vertex_colors: Optional per-vertex RGB colors in [0, 1], shape
+                [len(points), 3]. Where supported they take the place of
+                ``color`` and of the per-instance colors passed to
+                :meth:`log_instances`, and remain modulated by ``texture``.
+                Passing ``None`` clears colors logged previously for this mesh.
+                Ignored by backends without per-vertex color support.
         """
         pass
 

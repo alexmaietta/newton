@@ -1370,6 +1370,7 @@ void main() {
             self._pending_instance_visibility.clear()
             self._pending_mesh_points.clear()
             self._pending_mesh_normals.clear()
+            self._pending_mesh_colors.clear()
             self._pending_line_batches.clear()
             self._pending_point_batches.clear()
             self._gizmo_log = {}
@@ -1429,6 +1430,7 @@ void main() {
         color: tuple[float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        vertex_colors: wp.array[wp.vec3] | None = None,
     ) -> None:
         """Log a mesh for rendering.
 
@@ -1447,6 +1449,12 @@ void main() {
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            vertex_colors: Optional per-vertex RGB colors in [0, 1], shape
+                [len(points), 3], authored as a ``displayColor`` primvar with
+                ``vertex`` interpolation. They take the place of the
+                per-instance colors passed to :meth:`log_instances`. Colors
+                logged after the build phase only update meshes that were
+                built with them, since the primvar is authored on the stage.
         """
         name = self._qualify(name)
 
@@ -1463,6 +1471,7 @@ void main() {
                 color=color,
                 roughness=roughness,
                 metallic=metallic,
+                vertex_colors=vertex_colors,
             )
             self._mesh_prim_paths[name] = self._get_path(name)
         elif name in self._mesh_prim_paths:
@@ -1477,6 +1486,12 @@ void main() {
                     normals.numpy().astype(np.float32)
                     if isinstance(normals, wp.array)
                     else np.asarray(normals, dtype=np.float32)
+                )
+            if vertex_colors is not None and name in self._vertex_colored_meshes:
+                self._pending_mesh_colors[name] = (
+                    vertex_colors.numpy().astype(np.float32)
+                    if isinstance(vertex_colors, wp.array)
+                    else np.asarray(vertex_colors, dtype=np.float32)
                 )
 
     @override
@@ -1727,7 +1742,9 @@ void main() {
         return ViewerRTX._make_laned_array_dltensor(np.asarray(points_np, dtype=np.float32), lanes=3)
 
     def _update_ovrtx_mesh_points(self):
-        if self._rtx is None or (not self._pending_mesh_points and not self._pending_mesh_normals):
+        if self._rtx is None or not (
+            self._pending_mesh_points or self._pending_mesh_normals or self._pending_mesh_colors
+        ):
             return
         with wp.ScopedTimer("ViewerRTX::update_mesh_points", active=PROFILE_ENABLED, use_nvtx=True):
             for mesh_name, points_np in self._pending_mesh_points.items():
@@ -1750,6 +1767,11 @@ void main() {
                     attribute_name="normals",
                     tensors=[dl],
                 )
+            for mesh_name, colors_np in self._pending_mesh_colors.items():
+                prim_path = self._mesh_prim_paths.get(mesh_name)
+                if prim_path is None:
+                    continue
+                self._write_ovrtx_array_attribute(prim_path, "primvars:displayColor", colors_np)
 
     def _update_ovrtx_line_batches(self):
         if self._rtx is None or not self._pending_line_batches:
@@ -2063,6 +2085,7 @@ void main() {
         self._pending_instance_visibility = {}
         self._pending_mesh_points = {}
         self._pending_mesh_normals = {}
+        self._pending_mesh_colors = {}
         self._pending_line_batches = {}
         self._pending_point_batches = {}
 

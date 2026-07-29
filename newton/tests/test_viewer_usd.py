@@ -178,6 +178,70 @@ class TestViewerUSD(unittest.TestCase):
         leaked = [name for name in os.listdir(viewer._test_work_dir) if name.endswith(".tmp")]
         self.assertEqual(leaked, [])
 
+    def _log_triangle(self, viewer, name, vertex_colors=None):
+        points = wp.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=wp.vec3)
+        indices = wp.array([0, 1, 2], dtype=wp.int32)
+        viewer.log_mesh(name, points, indices, vertex_colors=vertex_colors)
+        return UsdGeom.Mesh.Get(viewer.stage, viewer._get_path(name))
+
+    def test_log_mesh_authors_vertex_interpolated_display_color(self):
+        """Write per-vertex colors as a `displayColor` primvar with `vertex` interpolation."""
+        viewer = self._make_viewer()
+        colors = wp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=wp.vec3)
+
+        viewer.begin_frame(0.0)
+        mesh_prim = self._log_triangle(viewer, "/vertex_colored", vertex_colors=colors)
+
+        primvar = mesh_prim.GetDisplayColorPrimvar()
+        self.assertEqual(primvar.GetInterpolation(), UsdGeom.Tokens.vertex)
+        np.testing.assert_allclose(
+            np.asarray(primvar.Get(viewer._frame_index), dtype=np.float32), colors.numpy(), atol=1e-6
+        )
+
+    def test_log_mesh_rejects_mismatched_vertex_color_count(self):
+        """Raise when the number of vertex colors does not match the number of points."""
+        viewer = self._make_viewer()
+        colors = wp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=wp.vec3)
+
+        viewer.begin_frame(0.0)
+        with self.assertRaises(ValueError):
+            self._log_triangle(viewer, "/bad_vertex_colors", vertex_colors=colors)
+
+    def test_log_mesh_blocks_display_color_when_vertex_colors_cleared(self):
+        """Drop the authored `displayColor` primvar when the mesh is re-logged without colors."""
+        viewer = self._make_viewer()
+        colors = wp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=wp.vec3)
+
+        viewer.begin_frame(0.0)
+        self._log_triangle(viewer, "/cleared", vertex_colors=colors)
+        mesh_prim = self._log_triangle(viewer, "/cleared")
+
+        self.assertIsNone(mesh_prim.GetDisplayColorPrimvar().Get(viewer._frame_index))
+
+    def test_log_instances_keeps_prototype_vertex_colors(self):
+        """Leave per-vertex colors intact instead of overriding them with per-instance colors.
+
+        Instance prims reference the prototype, so a constant `displayColor` authored
+        on the instance would win over the prototype's vertex-interpolated primvar.
+        """
+        viewer = self._make_viewer()
+        colors = wp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=wp.vec3)
+
+        viewer.begin_frame(0.0)
+        self._log_triangle(viewer, "/proto", vertex_colors=colors)
+        viewer.log_instances(
+            "/inst",
+            "/proto",
+            wp.array([wp.transform_identity()], dtype=wp.transform),
+            None,
+            wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3),
+            None,
+        )
+
+        instance = UsdGeom.Mesh.Get(viewer.stage, viewer._get_path("/inst") + "/instance_0")
+        resolved = np.asarray(instance.GetDisplayColorPrimvar().Get(viewer._frame_index), dtype=np.float32)
+        np.testing.assert_allclose(resolved, colors.numpy(), atol=1e-6)
+
     def test_log_points_treats_wp_float_triplet_as_single_constant_color(self):
         viewer = self._make_viewer()
 

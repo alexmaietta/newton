@@ -135,6 +135,18 @@ def fill_vertex_data(
 
 
 @wp.kernel
+def fill_vertex_color_data(
+    colors: wp.array[wp.vec3],
+    vertex_colors: wp.array[wp.vec4],
+):
+    tid = wp.tid()
+
+    c = colors[tid]
+    # w is the blend weight against the per-mesh/per-instance color (see shape_vertex_shader)
+    vertex_colors[tid] = wp.vec4(c[0], c[1], c[2], 1.0)
+
+
+@wp.kernel
 def fill_line_vertex_data(
     starts: wp.array[wp.vec3],
     ends: wp.array[wp.vec3],
@@ -158,6 +170,10 @@ def fill_line_vertex_data(
 class MeshGL:
     """Encapsulates mesh data and OpenGL buffers for a shape."""
 
+    # sizeof(vec4): per-vertex colors live in their own buffer so meshes without
+    # them do not pay for the extra vertex attribute
+    vertex_color_byte_size = 4 * 4
+
     def __init__(self, num_points, num_indices, device, hidden=False, backface_culling=True):
         """Initialize mesh data with vertices and indices."""
         gl = RendererGL.gl
@@ -174,6 +190,10 @@ class MeshGL:
         self.indices = None
         self.normals = None  # scratch buffer used during normal recomputation
         self.texture_id = None
+
+        # Optional per-vertex colors, packed as vec4 (rgb, blend weight).
+        self.vertex_colors = None  # staging buffer, allocated on first use
+        self.color_vbo = None
 
         # Set up vertex attributes in the packed format the shaders expect
         self.vertex_byte_size = 12 + 12 + 8
@@ -250,18 +270,24 @@ class MeshGL:
                 gl.glDeleteBuffers(1, self.vbo)
             if hasattr(self, "ebo"):
                 gl.glDeleteBuffers(1, self.ebo)
+            if getattr(self, "color_vbo", None) is not None:
+                gl.glDeleteBuffers(1, self.color_vbo)
             if hasattr(self, "texture_id") and self.texture_id is not None:
                 gl.glDeleteTextures(1, self.texture_id)
         except Exception:
             # Ignore any errors if the GL context has already been torn down
             pass
 
-    def update(self, points, indices, normals, uvs, texture=None):
+    def update(self, points, indices, normals, uvs, texture=None, vertex_colors=None):
         """Update vertex positions in the VBO.
 
         Args:
             points: New point positions (warp array or numpy array)
-            scale: Scaling factor for positions
+            indices: Triangle indices (only uploaded on the first update)
+            normals: Vertex normals, recomputed from the topology when None
+            uvs: Vertex texture coordinates
+            texture: Texture image or path, None clears the current texture
+            vertex_colors: Per-vertex colors as a warp vec3 array, None clears them
         """
         gl = RendererGL.gl
 
@@ -307,7 +333,55 @@ class MeshGL:
             gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
             gl.glBufferData(gl.GL_ARRAY_BUFFER, host_vertices.nbytes, host_vertices.ctypes.data, gl.GL_STATIC_DRAW)
 
+        self.update_vertex_colors(vertex_colors)
         self.update_texture(texture)
+
+    def update_vertex_colors(self, vertex_colors=None):
+        """Upload per-vertex colors, or drop them when *vertex_colors* is None.
+
+        Colors are stored in a dedicated VBO bound to attribute 9 with an alpha of
+        1 so the shader blends them over the per-mesh/per-instance color.
+        """
+        gl = RendererGL.gl
+
+        if vertex_colors is None:
+            if self.color_vbo is not None:
+                gl.glBindVertexArray(self.vao)
+                gl.glDisableVertexAttribArray(9)
+                gl.glBindVertexArray(0)
+                gl.glDeleteBuffers(1, self.color_vbo)
+                self.color_vbo = None
+            return
+
+        if len(vertex_colors) != self.num_points:
+            raise RuntimeError("Number of vertex colors does not match number of points")
+
+        if self.vertex_colors is None:
+            self.vertex_colors = wp.zeros(self.num_points, dtype=wp.vec4, device=self.device)
+
+        wp.launch(
+            fill_vertex_color_data,
+            dim=self.num_points,
+            inputs=[vertex_colors],
+            outputs=[self.vertex_colors],
+            device=self.device,
+        )
+
+        host_colors = self.vertex_colors.numpy()
+
+        first_upload = self.color_vbo is None
+        if first_upload:
+            self.color_vbo = gl.GLuint()
+            gl.glGenBuffers(1, self.color_vbo)
+
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.color_vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, host_colors.nbytes, host_colors.ctypes.data, gl.GL_DYNAMIC_DRAW)
+
+        if first_upload:
+            gl.glBindVertexArray(self.vao)
+            gl.glVertexAttribPointer(9, 4, gl.GL_FLOAT, gl.GL_FALSE, self.vertex_color_byte_size, ctypes.c_void_p(0))
+            gl.glEnableVertexAttribArray(9)
+            gl.glBindVertexArray(0)
 
     def recompute_normals(self):
         if self._points is None or self.indices is None:
@@ -366,6 +440,9 @@ class MeshGL:
             # Set per-mesh albedo and material (global state, not per-VAO).
             gl.glVertexAttrib3f(7, *self.color)
             gl.glVertexAttrib4f(8, *self.material)
+            if self.color_vbo is None:
+                # zero the per-vertex color weight (the generic default is (0,0,0,1))
+                gl.glVertexAttrib4f(9, 0.0, 0.0, 0.0, 0.0)
 
             gl.glBindVertexArray(self.vao)
             gl.glDrawElements(gl.GL_TRIANGLES, self.num_indices, gl.GL_UNSIGNED_INT, None)
@@ -673,6 +750,9 @@ class MeshInstancerGL:
 
         self.instance_transform_cuda_buffer = None
 
+        # id of the source mesh color VBO currently bound to this VAO (0 when unbound)
+        self._color_vbo_id = 0
+
         self.allocate(num_instances)
         self.active_instances = num_instances
 
@@ -794,6 +874,11 @@ class MeshInstancerGL:
 
         gl.glBindVertexArray(0)
 
+        # ------------------------
+        # optional per-vertex colors owned by the source mesh
+        self._color_vbo_id = 0
+        self._sync_vertex_colors()
+
         # Create CUDA buffer for instance transforms
         if ENABLE_CUDA_INTEROP and self.device.is_cuda:
             self._instance_transform_cuda_buffer = wp.RegisteredGLBuffer(
@@ -801,6 +886,31 @@ class MeshInstancerGL:
             )
         else:
             self._instance_transform_cuda_buffer = None
+
+    def _sync_vertex_colors(self):
+        """Mirror the source mesh's per-vertex color attribute into this VAO.
+
+        The mesh can gain or lose its color buffer after the instancer was
+        allocated, so the binding is refreshed whenever the buffer changes.
+        """
+        gl = RendererGL.gl
+
+        color_vbo = self.mesh.color_vbo
+        color_vbo_id = 0 if color_vbo is None else int(color_vbo.value)
+        if color_vbo_id == self._color_vbo_id:
+            return
+
+        gl.glBindVertexArray(self.vao)
+        if color_vbo_id:
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, color_vbo)
+            gl.glVertexAttribPointer(9, 4, gl.GL_FLOAT, gl.GL_FALSE, MeshGL.vertex_color_byte_size, ctypes.c_void_p(0))
+            gl.glVertexAttribDivisor(9, 0)  # per-vertex, not per-instance
+            gl.glEnableVertexAttribArray(9)
+        else:
+            gl.glDisableVertexAttribArray(9)
+        gl.glBindVertexArray(0)
+
+        self._color_vbo_id = color_vbo_id
 
     def update_from_transforms(
         self,
@@ -935,6 +1045,11 @@ class MeshInstancerGL:
             gl.glBindTexture(gl.GL_TEXTURE_2D, self.mesh.texture_id)
         else:
             gl.glBindTexture(gl.GL_TEXTURE_2D, RendererGL.get_fallback_texture())
+
+        self._sync_vertex_colors()
+        if not self._color_vbo_id:
+            # zero the per-vertex color weight (the generic default is (0,0,0,1))
+            gl.glVertexAttrib4f(9, 0.0, 0.0, 0.0, 0.0)
 
         gl.glBindVertexArray(self.vao)
         gl.glDrawElementsInstanced(

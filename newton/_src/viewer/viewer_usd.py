@@ -158,6 +158,7 @@ class ViewerUSD(ViewerBase):
         layer._instancers = {}  # instancer_name -> UsdGeom.PointInstancer
         layer._points = {}  # point_name -> UsdGeom.Points
         layer._texture_materials: dict[str, Any] = {}  # mesh_name -> UsdShade.Material
+        layer._vertex_colored_meshes: set[str] = set()  # meshes with a vertex-interpolated displayColor
 
     def _reset_stage(self):
         self.stage.GetRootLayer().Clear()
@@ -293,6 +294,7 @@ class ViewerUSD(ViewerBase):
         color: tuple[float, float, float] | None = None,
         roughness: float | None = None,
         metallic: float | None = None,
+        vertex_colors: wp.array[wp.vec3] | None = None,
     ):
         """
         Create a USD mesh prototype from vertex and index data.
@@ -312,6 +314,12 @@ class ViewerUSD(ViewerBase):
                 smooth, ``1`` is fully rough.
             metallic: Metallicity in ``[0, 1]``. ``0`` is dielectric, ``1``
                 is metal.
+            vertex_colors: Optional per-vertex RGB colors in [0, 1], shape
+                [len(points), 3], authored as a ``displayColor`` primvar with
+                ``vertex`` interpolation. They take the place of the
+                per-instance colors passed to :meth:`log_instances`. Passing
+                ``None`` blocks a previously authored primvar, which clears it
+                for every frame written so far.
         """
 
         name = self._qualify(name)
@@ -348,6 +356,25 @@ class ViewerUSD(ViewerBase):
             pv_api = UsdGeom.PrimvarsAPI(mesh_prim)
             st_pv = pv_api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
             st_pv.Set(uvs_np)
+
+        # Set per-vertex colors if provided
+        if vertex_colors is not None:
+            colors_np = (
+                vertex_colors.numpy().astype(np.float32)
+                if isinstance(vertex_colors, wp.array)
+                else np.asarray(vertex_colors, dtype=np.float32)
+            )
+            if len(colors_np) != len(points_np):
+                raise ValueError(
+                    f"Mesh '{name}' has {len(colors_np)} vertex colors for {len(points_np)} points; counts must match."
+                )
+            color_pv = mesh_prim.CreateDisplayColorPrimvar(UsdGeom.Tokens.vertex)
+            color_pv.Set(colors_np, self._frame_index)
+            self._vertex_colored_meshes.add(name)
+        elif name in self._vertex_colored_meshes:
+            # USD has no per-frame block, so this clears the primvar for the whole stage
+            mesh_prim.GetDisplayColorPrimvar().GetAttr().Block()
+            self._vertex_colored_meshes.discard(name)
 
         # Create and bind a textured material only when both texture and UVs are
         # provided — a UsdUVTexture shader with no "st" primvar would sample
@@ -470,8 +497,12 @@ class ViewerUSD(ViewerBase):
         else:
             scales = np.ones((len(xforms), 3), dtype=np.float32)
 
-        if colors is not None:
+        # A constant displayColor authored on the instance overrides the prototype's
+        # vertex-interpolated one, so per-vertex colors win over per-instance colors.
+        if colors is not None and mesh not in self._vertex_colored_meshes:
             colors = colors.numpy()
+        else:
+            colors = None
 
         for i in range(len(xforms)):
             instance_path = self._get_path(name) + f"/instance_{i}"
@@ -587,7 +618,8 @@ class ViewerUSD(ViewerBase):
             if scales is not None:
                 instancer.GetScalesAttr().Set(scales, self._frame_index)
 
-            if colors is not None:
+            # per-instance colors would mask the prototype's per-vertex colors
+            if colors is not None and mesh not in self._vertex_colored_meshes:
                 # Promote colors to proper numpy array format
                 colors_np = self._promote_colors_to_array(colors, num_instances)
 

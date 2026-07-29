@@ -13,8 +13,10 @@ from ._src.viewer import (
     ViewerUSD,
     ViewerViser,
 )
+from ._src.viewer.colormap import Colormap, sample_colormap
 
 __all__ = [
+    "Colormap",
     "Layer",
     "ViewerBase",
     "ViewerFile",
@@ -24,4 +26,5 @@ __all__ = [
     "ViewerRerun",
     "ViewerUSD",
     "ViewerViser",
+    "sample_colormap",
 ]
